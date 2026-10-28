@@ -1096,6 +1096,32 @@ const DSH_CLIENT_VERSION_FALLBACK = '0.2.0-rc.2';
 const BALANCE_API_URL = 'https://api.deepseek.com/user/balance';
 const BALANCE_API_TIMEOUT_MS = 8000;
 
+/* ---------------------------------------------------------------------------
+ * OpenCode Go quota bridge — GET /theme-endfield/ocg
+ *
+ * Copied from dsh-whale-widget's measured recipe (lib/index.js `opencode_go`):
+ * ONE GET https://opencode.ai/zen/go/v1/usage with `Authorization: Bearer
+ * <OPENCODE_GO_API_KEY>` answers all three subscription windows at once —
+ * usage.rolling / usage.weekly / usage.monthly, each { percent, resetsAt },
+ * where `percent` is the USED share (x-api-key alone returns 401; the bearer
+ * header is the documented working shape).
+ *
+ * WHY A HOST ROUTE. The page never sees the credential: OPENCODE_GO_API_KEY is
+ * resolved by the host credentials service, exactly like the DeepSeek key in
+ * fetchApiKeyBalance. A page-side call would have to ship the key to the browser.
+ *
+ * The answer is normalised so the client does not parse provider JSON:
+ *   { ok: true, source: 'opencode_go', at, windows: [
+ *       { key: 'rolling', label: '5h', usedPct: 38, remainPct: 62, resetAt } ] }
+ * `usedPct` is clamped to 0..100 (the source owns the value, not its range); a
+ * failure answers { ok: false, why } with HTTP 200 so the capsule can keep the
+ * last known read instead of flickering an error state.
+ * ------------------------------------------------------------------------ */
+const OCG_USAGE_URL = 'https://opencode.ai/zen/go/v1/usage';
+const OCG_API_TIMEOUT_MS = 8000;
+const OCG_WINDOW_KEYS = ['rolling', 'weekly', 'monthly'];
+const OCG_WINDOW_LABELS = { rolling: '5h', weekly: '周', monthly: '月' };
+
 /* Route 1: the API key path. Resolves the DEEPSEEK_API_KEY credential through
  * the host credentials service and asks the official balance endpoint.
  * Returns null when there is no key to try (caller falls through to the
@@ -1220,6 +1246,121 @@ function registerBalanceBridge(ctx) {
 }
 
 /**
+ * Ask OpenCode Go for the subscription windows and normalise them for the pill.
+ *
+ * The two attempts mirror the wallet route: a network/5xx failure gets one short
+ * retry (the endpoint is usually a CDN edge, so a transient TLS/network blip is
+ * worth one more shot), while 4xx is authoritative — a bad or rotated key must
+ * not be hammered. Any failure is reported as data, not thrown: the client keeps
+ * the previous read and the capsule never blanks on a transient error.
+ *
+ * @param ctx - host Cordis context (credentials service).
+ * @returns {Promise<object>} `{ ok: true, source, at, windows }` or `{ ok:false, why }`.
+ */
+async function fetchOcgQuota(ctx) {
+  let cred = null;
+  try {
+    const credentials = serviceOf(ctx, 'credentials');
+    if (credentials && typeof credentials.resolve === 'function') {
+      cred = await credentials.resolve('OPENCODE_GO_API_KEY');
+    }
+  } catch (error) {
+    return { ok: false, why: 'OPENCODE_GO_API_KEY 读取失败: ' + String(error && error.message ? error.message : error) };
+  }
+  if (!cred || !cred.value) return { ok: false, why: '未配置 OPENCODE_GO_API_KEY' };
+  let lastError = '';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let res;
+    try {
+      res = await fetch(OCG_USAGE_URL, {
+        headers: { Authorization: 'Bearer ' + cred.value, Accept: 'application/json' },
+        signal: AbortSignal.timeout(OCG_API_TIMEOUT_MS),
+      });
+    } catch (error) {
+      lastError = String(error && error.message ? error.message : error);
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        continue;
+      }
+      return { ok: false, why: '额度接口请求失败: ' + lastError };
+    }
+    if (!res.ok) {
+      lastError = 'HTTP ' + res.status;
+      if (res.status >= 500 && attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        continue;
+      }
+      return { ok: false, why: '额度接口返回 ' + lastError };
+    }
+    let data;
+    try {
+      data = await res.json();
+    } catch (error) {
+      return { ok: false, why: '额度接口返回不是合法 JSON' };
+    }
+    const usage = data && typeof data === 'object' && data.usage && typeof data.usage === 'object' ? data.usage : null;
+    if (!usage) return { ok: false, why: '额度接口返回结构异常' };
+    const windows = [];
+    for (const key of OCG_WINDOW_KEYS) {
+      const window = usage[key];
+      if (!window || typeof window !== 'object') continue;
+      const raw = Number(window.percent);
+      if (!Number.isFinite(raw)) continue;
+      const usedPct = Math.max(0, Math.min(100, Math.round(raw)));
+      windows.push({
+        key,
+        label: OCG_WINDOW_LABELS[key],
+        usedPct,
+        remainPct: 100 - usedPct,
+        resetAt: window.resetsAt === undefined || window.resetsAt === null ? null : window.resetsAt,
+      });
+    }
+    if (windows.length === 0) return { ok: false, why: '额度接口没有可解析的窗口' };
+    return { ok: true, source: 'opencode_go', at: Date.now(), windows };
+  }
+  return { ok: false, why: '额度接口请求失败: ' + lastError };
+}
+
+/**
+ * Mount GET /theme-endfield/ocg. Same lifecycle as the wallet bridge: the route
+ * is registered unconditionally and costs nothing while the page does not poll
+ * it (the capsule only asks while the current session runs on OpenCode Go).
+ *
+ * @param ctx - host Cordis context.
+ */
+function registerOcgBridge(ctx) {
+  const webServer = serviceOf(ctx, 'webServer');
+  const mount = (webServer) => {
+    if (webServer === undefined || typeof webServer.register !== 'function') return;
+    const send = (res, code, payload) => {
+      res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(JSON.stringify(payload));
+    };
+    try {
+      webServer.register({
+        kind: 'prefix',
+        path: '/theme-endfield/ocg',
+        handler: async (req, res) => {
+          const pathname = String(req.url || '').split('?')[0];
+          if (req.method !== 'GET' || pathname !== '/theme-endfield/ocg') {
+            return send(res, 404, { error: 'not found' });
+          }
+          try {
+            return send(res, 200, await fetchOcgQuota(ctx));
+          } catch (error) {
+            return send(res, 200, { ok: false, why: String(error && error.message ? error.message : error) });
+          }
+        },
+      });
+    } catch (error) {
+      console.error(`${LOG_TAG} ocg bridge failed: ${error && error.message ? error.message : error}`);
+    }
+  };
+  if (webServer !== undefined) mount(webServer);
+  else if (typeof ctx.inject === 'function') ctx.inject(['webServer'], (scope) => mount(scope.webServer));
+}
+
+/**
  * A `get()` / `watch()` view over this plugin's OWN resolved Config.
  *
  * DSH >= 0.1.7 has no scope to hand a plugin: a preference edit reaches a running
@@ -1288,6 +1429,9 @@ function apply(ctx, config) {
   // The balance capsule route mounts unconditionally: the page polls it only
   // when its own switch is on, so the route itself costs nothing at rest.
   try { registerBalanceBridge(ctx); } catch (e) { /* never load-bearing */ }
+  // OpenCode Go quota read: same contract as the wallet bridge — the capsule
+  // asks it only while the session's model provider is opencode-go.
+  try { registerOcgBridge(ctx); } catch (e) { /* never load-bearing */ }
 
   let audioInstalled = false;
   const startAudio = (settingsScope) => {
@@ -1399,5 +1543,7 @@ module.exports = {
   hasVisibleText,
   installAudio,
   registerBalanceBridge,
+  registerOcgBridge,
+  fetchOcgQuota,
   configPrefScope,
 };

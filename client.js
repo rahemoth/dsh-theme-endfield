@@ -366,6 +366,23 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
     // a fast network; MAX is the cap when nothing ever answers.
     const BALANCE_BOOT_MIN_MS = 900
     const BALANCE_BOOT_MAX_MS = 5000
+
+    /* ---------- OpenCode Go 套餐 (host route /theme-endfield/ocg) ----------
+       Auto mode: while the session's current model provider is `opencode-go`,
+       the pill swaps the DeepSeek wallet read for the 5h subscription window
+       plus its reset countdown, and falls back to the wallet the moment the
+       session moves to any other provider. The host half resolves
+       OPENCODE_GO_API_KEY and talks to https://opencode.ai/zen/go/v1/usage
+       (the recipe measured in dsh-whale-widget); this half only paints the
+       normalised windows it returns. */
+    const OCG_URL = '/theme-endfield/ocg'
+    const OCG_PROVIDER = 'opencode-go'
+    const OCG_POLL_MIN_MS = 60000
+    const OCG_FAILURE_RETRY_MS = 30000
+    /* Which window the pill leads with: rolling = the 5h block. The other two
+       are still carried in the payload for future layouts; the capsule shows
+       the 5h read because that is the window a coding session burns first. */
+    const OCG_PRIMARY_WINDOW = 'rolling'
     /* 胶囊停靠位与防遮挡的字面量集（设置页下拉与读取器共用） */
     const BALANCE_POSITION_KEY = 'balanceCapsulePosition'
     const BALANCE_POSITION_OPTIONS = ['center', 'left', 'right']
@@ -4684,6 +4701,20 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
     let creditsUnsub = null
     let creditsRebindTimer = null
     let creditsRebindAttempts = 0
+    /* OpenCode Go state. `ocgActive` is true while the current session's model
+       provider is opencode-go — it owns the pill until another provider's
+       directory is read. `ocgResetAt` is the absolute reset instant of the 5h
+       window; the 1s tick re-renders the countdown from it, so a missed paint
+       never freezes the clock. `balanceLastWallet` keeps the last wallet read so
+       leaving OCG mode repaints instantly instead of flashing the seed. */
+    let ocgActive = false
+    let ocgBusy = false
+    let ocgLastFetchAt = 0
+    let ocgResetAt = 0
+    let ocgWindows = null
+    let ocgWatchedStore = null
+    let ocgUnsub = null
+    let balanceLastWallet = null
     /* Rate limiting the usage.badge calls. Two refresh paths feed creditsApply
        — the shared 60s poll and every model-directory publish — and without a
        client-side floor both would fire an RPC each time. The host badge cache
@@ -4850,6 +4881,19 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         try { creditsUnsub() } catch (e) { /* store already gone */ }
       }
       creditsUnsub = null
+      // Same detach for the OCG watch: it reuses the credits debounce, so one
+      // unsubscribed store is enough to stop both refresh paths.
+      if (typeof ocgUnsub === 'function') {
+        try { ocgUnsub() } catch (e) { /* store already gone */ }
+      }
+      ocgUnsub = null
+      ocgWatchedStore = null
+      ocgActive = false
+      ocgBusy = false
+      ocgWindows = null
+      ocgResetAt = 0
+      ocgLastFetchAt = 0
+      balanceLastWallet = null
       if (creditsRebindTimer !== null && typeof clearTimeout === 'function') {
         clearTimeout(creditsRebindTimer)
         creditsRebindTimer = null
@@ -5020,6 +5064,158 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       balanceEl.setAttribute('data-endfield-credit-mode', paint.mode)
     }
 
+    /* ---------- OpenCode Go 套餐渲染 (host route /theme-endfield/ocg) ----------
+       A third capsule mode beside wallet/credits, driven by the same
+       data-endfield-credit-mode attribute. Only the 5h window is on screen: the
+       big number is the REMAINING share (what is left to spend) and the window
+       group carries the reset countdown, so the pill answers "how much left /
+       when does it refill" without a second row. The ring sweeps the same
+       remaining share, so number and dial never disagree. A failed answer paints
+       -- instead of 0: 0 would read as "out of quota" and that is a lie the
+       user could act on. */
+    const ocgPickWindow = () => {
+      if (!Array.isArray(ocgWindows)) return null
+      return ocgWindows.find((w) => w && (w.key === OCG_PRIMARY_WINDOW || w.label === '5h')) || ocgWindows[0] || null
+    }
+
+    const ocgPaintCountdown = () => {
+      if (balanceEl === null || typeof document === 'undefined') return
+      const node = balanceEl.querySelector('[data-endfield-ocg-remain]')
+      if (!node) return
+      if (!ocgResetAt) { node.textContent = ''; return }
+      const ms = ocgResetAt - Date.now()
+      node.textContent = ms > 0 ? balanceFormatCountdown(ms) : '00:00:00'
+    }
+
+    const ocgPaint = (paint) => {
+      if (balanceEl === null || typeof document === 'undefined') return
+      const setText = (attr, text) => {
+        const node = balanceEl.querySelector('[' + attr + ']')
+        if (node) node.textContent = text
+      }
+      setText('data-endfield-ocg-label', '5h')
+      setText('data-endfield-ocg-int', paint.int)
+      setText('data-endfield-ocg-unit', '%')
+      if (typeof balanceEl.style?.setProperty === 'function') {
+        balanceEl.style.setProperty(
+          '--endfield-balance-sweep',
+          (Number.isFinite(paint.sweepPct) ? paint.sweepPct * 3.6 : 0) + 'deg',
+        )
+      }
+      balanceEl.setAttribute('data-endfield-credit-mode', 'ocg')
+      ocgPaintCountdown()
+    }
+
+    const ocgPaintIdle = () => ocgPaint({ int: '--', sweepPct: NaN })
+
+    /* Hand the pill back after OCG loses the session: the last wallet read is
+       repainted when there is one, otherwise the seed -- is the honest state. */
+    const ocgRelease = () => {
+      if (balanceEl === null) return
+      if (creditProvider !== null) { creditPaintIdle(); return }
+      balanceEl.setAttribute('data-endfield-credit-mode', 'wallet')
+      if (balanceLastWallet) balancePaint(balanceLastWallet)
+      else balancePaint({ currency: '', int: '--', frac: '' })
+    }
+
+    const ocgSetActive = (active) => {
+      if (active === ocgActive) return
+      ocgActive = active
+      ocgWindows = null
+      ocgResetAt = 0
+      if (active) {
+        // Entering the mode always fetches once: the pill must not sit on -- for
+        // a minute because a previous visit's throttle stamp is still fresh.
+        ocgLastFetchAt = 0
+        ocgPaintIdle()
+      } else {
+        ocgRelease()
+        // A stale in-flight answer must not paint after the mode is gone;
+        // ocgApply re-reads ocgActive on arrival.
+        ocgLastFetchAt = 0
+      }
+    }
+
+    const ocgApply = async (force) => {
+      if (ocgBusy || typeof fetch !== 'function') return
+      const now = Date.now()
+      if (force !== true && now - ocgLastFetchAt < OCG_POLL_MIN_MS) return
+      ocgBusy = true
+      try {
+        const res = await fetch(OCG_URL, { method: 'GET' })
+        const payload = await res.json().catch(() => null)
+        if (!ocgActive) return
+        if (!payload || payload.ok !== true || !Array.isArray(payload.windows) || payload.windows.length === 0) {
+          ocgWindows = null
+          ocgResetAt = 0
+          ocgPaintIdle()
+          ocgLastFetchAt = Date.now() - OCG_POLL_MIN_MS + OCG_FAILURE_RETRY_MS
+          return
+        }
+        ocgWindows = payload.windows
+        const window = ocgPickWindow()
+        const remain = window && Number.isFinite(window.remainPct)
+          ? window.remainPct
+          : (window && Number.isFinite(window.usedPct) ? 100 - window.usedPct : null)
+        let resetAt = 0
+        if (window && window.resetAt !== null && window.resetAt !== undefined) {
+          const parsed = typeof window.resetAt === 'number'
+            ? (window.resetAt > 1e12 ? window.resetAt : window.resetAt * 1000)
+            : Date.parse(String(window.resetAt))
+          if (Number.isFinite(parsed)) resetAt = parsed
+        }
+        ocgResetAt = resetAt
+        ocgPaint({ int: remain === null ? '--' : String(remain), sweepPct: remain === null ? NaN : remain })
+        ocgLastFetchAt = Date.now()
+      } catch (e) {
+        if (ocgActive) {
+          ocgWindows = null
+          ocgResetAt = 0
+          ocgPaintIdle()
+          ocgLastFetchAt = Date.now() - OCG_POLL_MIN_MS + OCG_FAILURE_RETRY_MS
+        }
+      } finally {
+        ocgBusy = false
+      }
+    }
+
+    /* Read the SAME session directory the credits mode watches and decide which
+       provider owns the pill. A switch (or the first load) repaints before the
+       next 60s poll; ordinary publishes keep the fetch throttle. */
+    const ocgRefresh = async (force) => {
+      if (balanceEl === null) return
+      let sessions = null
+      try { sessions = ctx.get('sessions') } catch (e) { sessions = null }
+      if (!sessions || !sessions.list || typeof sessions.list.getSnapshot !== 'function') return
+      let snap = null
+      try { snap = sessions.list.getSnapshot() } catch (e) { snap = null }
+      const id = snap ? thunderCurrentId(snap) : undefined
+      if (id === undefined || id === null) { ocgSetActive(false); return }
+      let directories = null
+      try { directories = ctx.get('modelDirectories') } catch (e) { directories = null }
+      if (!directories || typeof directories.directoryFor !== 'function') return
+      let directory = null
+      try { directory = directories.directoryFor(id) } catch (e) { directory = null }
+      if (!directory || !directory.store) return
+      if (ocgWatchedStore !== directory.store) {
+        if (typeof ocgUnsub === 'function') { try { ocgUnsub() } catch (e) { /* gone */ } }
+        ocgUnsub = null
+        ocgWatchedStore = directory.store
+        if (typeof directory.store.subscribe === 'function') {
+          try { ocgUnsub = directory.store.subscribe(() => { creditsRebind() }) } catch (e) { ocgUnsub = null }
+        }
+      }
+      if (typeof directory.load === 'function') {
+        try { await directory.load() } catch (e) { /* unreadable: fall through to snapshot */ }
+      }
+      let state = null
+      try { state = directory.store.getSnapshot() } catch (e) { state = null }
+      const provider = state && state.current ? state.current.provider : undefined
+      const active = typeof provider === 'string' && (provider === OCG_PROVIDER || provider.indexOf(OCG_PROVIDER) === 0)
+      if (active !== ocgActive) ocgSetActive(active)
+      if (active) await ocgApply(force === true)
+    }
+
     /* The capsule paints ONE mode at a time. 'wallet' keeps the DeepSeek
        money group; 'credits' swaps in the channel read; while a jet-hub
        provider is live but has not answered yet the capsule shows the channel
@@ -5027,6 +5223,9 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
        channel's name. Consumption reads need a quota: without one the pct
        slot stays empty and the dial sweep is zeroed, never guessed. */
     const creditPaintIdle = () => {
+      // OCG mode owns the pill while it is active; the credits idle paint must
+      // not yank it back to the wallet seed on every poll.
+      if (ocgActive) return
       if (creditProvider === null) {
         creditPaint({ mode: 'wallet', int: '', unitText: '', channel: '', pctText: '', usedPct: NaN, sweepPct: NaN })
         return
@@ -5203,10 +5402,13 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       if (balanceEl === null) return
       if (creditsRebindTimer !== null && typeof clearTimeout === 'function') clearTimeout(creditsRebindTimer)
       creditsRebindTimer = null
-      if (typeof setTimeout !== 'function') { creditsRefresh(true); return }
+      if (typeof setTimeout !== 'function') { creditsRefresh(true); ocgRefresh(true); return }
       creditsRebindTimer = setTimeout(() => {
         creditsRebindTimer = null
         creditsRefresh(true)
+        // One debounce serves both mode decisions: a provider flip must repaint
+        // the pill immediately whichever half owns it.
+        ocgRefresh(true)
       }, 150)
     }
 
@@ -5423,8 +5625,9 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       // a jet-hub channel must not have the next tick overwrite the sweep or
       // resurrect the countdown text. The 1s interval keeps running for the
       // wallet mode's collapse bookkeeping; this early return is the whole
-      // mode handoff.
-      if (creditProvider !== null) {
+      // mode handoff. OCG mode owns the same dial for its 5h reset countdown
+      // (painted by ocgPaintCountdown), so it stops this painter too.
+      if (creditProvider !== null || ocgActive) {
         if (balanceBootAt !== 0) {
           const waited = Date.now() - balanceBootAt
           const ready = balanceBootAnswered || waited >= BALANCE_BOOT_MAX_MS
@@ -5492,10 +5695,14 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         // A wallet answer never overwrites the channel read: while a jet-hub
         // provider is live the money group belongs to it, so the DeepSeek
         // poll only refreshes the numbers the wallet mode will show when the
-        // user switches back.
-        if (payload && payload.ok && creditProvider === null) {
+        // user switches back. The same holds for the OCG mode, which owns the
+        // pill while the session's provider is opencode-go.
+        if (payload && payload.ok) {
           const wallet = balancePickWallet(payload.wallets)
-          if (wallet) balancePaint(wallet)
+          if (wallet) {
+            balanceLastWallet = wallet
+            if (creditProvider === null && !ocgActive) balancePaint(wallet)
+          }
         }
       } catch (e) { /* keep last known values; the next poll retries */ } finally {
         balanceBusy = false
@@ -5545,6 +5752,19 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         '<span data-endfield-credit-channel></span>' +
         '<span data-endfield-credit-int>--</span>' +
         '<span data-endfield-credit-unit></span>' +
+        '</span>' +
+        // The OpenCode Go read is the third state of the same attribute: the 5h
+        // window's remaining share as the big number, and its refill countdown
+        // as the middle caption (the wallet's pricing run is hidden in this
+        // mode). No unit tag beyond % — the window label is the unit.
+        '<span data-endfield-ocg-money>' +
+        '<span data-endfield-ocg-label>5h</span>' +
+        '<span data-endfield-ocg-int>--</span>' +
+        '<span data-endfield-ocg-unit>%</span>' +
+        '</span>' +
+        '<span data-endfield-ocg-window>' +
+        '重置' +
+        '<span data-endfield-ocg-remain></span>' +
         '</span>' +
         // The pricing countdown is the wallet mode's middle read only — peak/
         // off-peak windows are a DeepSeek API concept, so the credits mode
@@ -5608,17 +5828,28 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       creditPaintIdle()
       balanceFetch()
       creditsStart()
+      // The provider read decides whether OCG takes the pill; it resolves the
+      // same directory the credits mode does, just once at mount and then on
+      // every heartbeat.
+      ocgRefresh()
       balancePaintWindow()
       if (typeof setInterval === 'function') {
-        balanceTimer = setInterval(balancePaintWindow, BALANCE_TICK_MS)
-        // One poll heartbeat drives both reads: the wallet fetch and a channel
-        // re-resolve. The credit half is throttled inside creditsApply
-        // (CREDITS_MIN_INTERVAL_MS since that provider's last completed
-        // fetch), so the 60s heartbeat itself costs one cheap local lookup
-        // and an actual usage.badge RPC only every five minutes per provider.
+        // The 1s tick repaints the wallet's pricing window and the OCG reset
+        // countdown; each painter early-returns for the mode it does not own.
+        balanceTimer = setInterval(() => {
+          balancePaintWindow()
+          if (ocgActive) ocgPaintCountdown()
+        }, BALANCE_TICK_MS)
+        // One poll heartbeat drives every read: the wallet fetch, a channel
+        // re-resolve and the OCG quota read. The credit half is throttled
+        // inside creditsApply (CREDITS_MIN_INTERVAL_MS since that provider's
+        // last completed fetch), and the OCG half by ocgApply's own floor, so
+        // the 60s heartbeat itself is only cheap local lookups plus one route
+        // call per minute while the session stays on OpenCode Go.
         balancePollTimer = setInterval(() => {
           balanceFetch()
           creditsRefresh(false)
+          ocgRefresh(false)
         }, BALANCE_POLL_MS)
       }
     }
@@ -8311,6 +8542,60 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         font-size: 9px;
         font-weight: 600;
         color: #a2a1a2;
+      }
+      /* ---------- OpenCode Go 套餐 group (host route /theme-endfield/ocg) ----------
+         Third exclusive state of the same attribute. The money group is one big
+         read (5h 剩余%), the window group is its refill countdown; both stay
+         hidden until data-endfield-credit-mode='ocg', and that same attribute
+         hides the wallet's money/window/pct and the channel credit group, so
+         exactly one read is ever on screen. */
+      [data-endfield-balance] [data-endfield-ocg-money] {
+        display: none;
+        align-items: baseline;
+        flex: none;
+      }
+      [data-endfield-balance] [data-endfield-ocg-window] {
+        display: none;
+        font-size: 9px;
+        font-weight: 500;
+        color: #a2a1a2;
+      }
+      [data-endfield-balance][data-endfield-credit-mode='ocg'] [data-endfield-balance-money],
+      [data-endfield-balance][data-endfield-credit-mode='ocg'] [data-endfield-balance-window],
+      [data-endfield-balance][data-endfield-credit-mode='ocg'] [data-endfield-balance-pct],
+      [data-endfield-balance][data-endfield-credit-mode='ocg'] [data-endfield-credit-money],
+      [data-endfield-balance][data-endfield-credit-mode='ocg'] [data-endfield-credit-pct] {
+        display: none;
+      }
+      [data-endfield-balance][data-endfield-credit-mode='ocg'] [data-endfield-ocg-money] {
+        display: inline-flex;
+      }
+      [data-endfield-balance][data-endfield-credit-mode='ocg'] [data-endfield-ocg-window] {
+        display: inline;
+      }
+      [data-endfield-balance] [data-endfield-ocg-label] {
+        margin-right: 4px;
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        color: #8d8c88;
+      }
+      [data-endfield-balance] [data-endfield-ocg-int] {
+        font-size: 14px;
+        font-weight: 700;
+        color: #f1f1ec;
+        font-variant-numeric: tabular-nums;
+        font-feature-settings: 'tnum' 1, 'ss01' 1;
+      }
+      [data-endfield-balance] [data-endfield-ocg-unit] {
+        margin-left: 2px;
+        font-size: 9px;
+        font-weight: 600;
+        color: #a2a1a2;
+      }
+      [data-endfield-balance] [data-endfield-ocg-remain] {
+        margin-left: 2px;
+        font-variant-numeric: tabular-nums;
       }
       /* 低谷时段剩余hh:mm:ss — one grey caption, not three tokens. */
       [data-endfield-balance] [data-endfield-balance-window] {
