@@ -4856,22 +4856,6 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
     const BALANCE_HOVER_BOTTOM = 12
     const BALANCE_HOVER_HYSTERESIS_MS = 240
     let balanceHoverUntil = 0
-    /* Expanded OCG card: the detail panel is an absolutely positioned child, so
-       it does not change the pill's own rect. While it is open, the pointer zone
-       is the union of the pill band and the panel box (plus slack) — without the
-       union, moving down onto the card would leave the band and collapse it. */
-    const BALANCE_OCG_PANEL_SLACK = 8
-    const balanceOcgPanelInside = (clientX, clientY) => {
-      if (balanceEl === null || typeof document === 'undefined') return false
-      const panel = balanceEl.querySelector('[data-endfield-ocg-details]')
-      if (!panel) return false
-      const rect = panel.getBoundingClientRect()
-      if (rect.width <= 0 || rect.height <= 0) return false
-      return clientX >= rect.left - BALANCE_OCG_PANEL_SLACK
-        && clientX <= rect.right + BALANCE_OCG_PANEL_SLACK
-        && clientY >= rect.top - BALANCE_OCG_PANEL_SLACK
-        && clientY <= rect.bottom + BALANCE_OCG_PANEL_SLACK
-    }
     const balanceExpandApply = (want) => {
       if (want === balanceExpanded) return
       balanceExpanded = want
@@ -4901,12 +4885,13 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       if (clientX === null || clientY === null) return
       const rect = balanceEl.getBoundingClientRect()
       if (rect.width <= 0) return
-      const insideBand = clientX >= rect.left + rect.width / 2 - BALANCE_HOVER_HALF_W
+      // The band is recomputed from the LIVE rect on every move, so while the
+      // capsule is grown into its hover card the taller box is its own hover
+      // zone — moving around inside the card keeps it open, leaving it collapses.
+      const inside = clientX >= rect.left + rect.width / 2 - BALANCE_HOVER_HALF_W
         && clientX <= rect.left + rect.width / 2 + BALANCE_HOVER_HALF_W
         && clientY >= rect.top + BALANCE_HOVER_TOP
         && clientY <= rect.bottom + BALANCE_HOVER_BOTTOM
-      const inside = insideBand
-        || (ocgActive && balanceExpanded && balanceOcgPanelInside(clientX, clientY))
       const now = Date.now()
       if (inside) balanceHoverUntil = now + BALANCE_HOVER_HYSTERESIS_MS
       if (balanceHideRaf !== 0 || typeof cancelAnimationFrame !== 'function') {
@@ -5162,25 +5147,30 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       return balanceFormatCountdown(ms)
     }
 
-    /* The weekly/monthly rows live in the hover detail card. Repainting them on
-       every tick keeps the duration honest while the card is open; the writes are
-       plain textContent on four nodes, cheap enough for the 1s heartbeat. */
+    /* The three rows live in the hover card. Repainting them on every tick keeps
+       the durations honest while the card is open; the writes are plain
+       textContent on six nodes, cheap enough for the 1s heartbeat. The 5h row
+       reads the SAME values as the row-level pill paint, so the two can never
+       disagree. */
     const ocgPaintDetails = () => {
       if (balanceEl === null || typeof document === 'undefined') return
       const setText = (attr, text) => {
         const node = balanceEl.querySelector('[' + attr + ']')
         if (node) node.textContent = text
       }
-      for (const key of ['weekly', 'monthly']) {
-        const window = ocgWindowByKey(key)
+      const paintRow = (slot, window, resetAt) => {
         let pct = null
         if (window) {
           if (Number.isFinite(window.remainPct)) pct = window.remainPct
           else if (Number.isFinite(window.usedPct)) pct = 100 - window.usedPct
         }
-        setText('data-endfield-ocg-' + key + '-pct', pct === null ? '--' : pct + '%')
-        const resetAt = ocgResetInstant(window)
-        setText('data-endfield-ocg-' + key + '-reset', resetAt ? '重置 ' + ocgFormatSpan(resetAt - Date.now()) : '')
+        setText('data-endfield-ocg-card-' + slot + '-pct', pct === null ? '--' : pct + '%')
+        setText('data-endfield-ocg-card-' + slot + '-reset', resetAt ? '重置 ' + ocgFormatSpan(resetAt - Date.now()) : '')
+      }
+      paintRow('5h', ocgPickWindow(), ocgResetAt)
+      for (const key of ['weekly', 'monthly']) {
+        const window = ocgWindowByKey(key)
+        paintRow(key, window, ocgResetInstant(window))
       }
     }
 
@@ -5948,20 +5938,30 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         '<span data-endfield-balance-brand-title>DeepSeek 当前低谷</span>' +
         '</span>' +
         '</span>' +
-        // Hover detail card (OCG only): the weekly/monthly windows the one-line
-        // pill has no room for. Absolutely positioned under the pill (so opening
-        // it never re-lays-out the capsule) and shown by the expanded attribute
-        // the hover geometry sets; the four values are painted by ocgPaintDetails.
-        '<span data-endfield-ocg-details>' +
-        '<span data-endfield-ocg-detail>' +
-        '<span data-endfield-ocg-detail-key>周</span>' +
-        '<span data-endfield-ocg-weekly-pct>--</span>' +
-        '<span data-endfield-ocg-weekly-reset></span>' +
+        // Hover pose (OCG only): the capsule MORPHS from the 32px row into a big
+        // card — the exact height/min-width/cap transition the boot pose runs,
+        // only in the other direction (grow instead of shrink) — and the three
+        // windows render INSIDE it. Absolute inset like the brand pose, so the
+        // box animates while the two contents cross-fade in place.
+        '<span data-endfield-ocg-card>' +
+        '<span data-endfield-ocg-card-head>' +
+        '<span data-endfield-ocg-card-kicker>/// OPENCODE GO</span>' +
+        '<span data-endfield-ocg-card-title>额度剩余</span>' +
         '</span>' +
-        '<span data-endfield-ocg-detail>' +
-        '<span data-endfield-ocg-detail-key>月</span>' +
-        '<span data-endfield-ocg-monthly-pct>--</span>' +
-        '<span data-endfield-ocg-monthly-reset></span>' +
+        '<span data-endfield-ocg-card-row>' +
+        '<span data-endfield-ocg-card-key>5h</span>' +
+        '<span data-endfield-ocg-card-5h-pct>--</span>' +
+        '<span data-endfield-ocg-card-5h-reset></span>' +
+        '</span>' +
+        '<span data-endfield-ocg-card-row>' +
+        '<span data-endfield-ocg-card-key>周</span>' +
+        '<span data-endfield-ocg-card-weekly-pct>--</span>' +
+        '<span data-endfield-ocg-card-weekly-reset></span>' +
+        '</span>' +
+        '<span data-endfield-ocg-card-row>' +
+        '<span data-endfield-ocg-card-key>月</span>' +
+        '<span data-endfield-ocg-card-monthly-pct>--</span>' +
+        '<span data-endfield-ocg-card-monthly-reset></span>' +
         '</span>' +
         '</span>'
       document.body.appendChild(el)
@@ -8778,52 +8778,87 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         margin-left: 2px;
         font-variant-numeric: tabular-nums;
       }
-      /* ---------- OCG hover detail card ----------
-         Opened by data-endfield-balance-expanded (set from the mousemove
-         geometry). Absolute so opening it never re-flows the 32px pill; it hangs
-         under the pill and right-aligns to the pill's right edge. The hover zone
-         includes this box while it is open, otherwise moving down onto the card
-         would leave the pill band and immediately collapse it. */
-      [data-endfield-balance] [data-endfield-ocg-details] {
-        display: none;
+      /* ---------- OCG hover pose: the row GROWS into a card ----------
+         The boot pose morphs the capsule 72px -> 32px on one declared transition
+         (height / min-width / padding / --endfield-balance-cap), so the silhouette
+         stays a stadium at every frame. The hover pose reuses exactly that
+         machinery in the other direction: hovering an OCG pill grows it into a
+         100px card and the three windows render INSIDE it. No scale() — the grow
+         IS the animation, mirroring how the entrance pose shrinks home. */
+      [data-endfield-balance][data-endfield-credit-mode='ocg'][data-endfield-balance-expanded='1'] {
+        --endfield-balance-cap: 50px;
+        height: 100px;
+        min-width: min(448px, calc(100vw - 16px));
+        padding: 0 22px;
+      }
+      /* The row content steps aside while the card holds the box. Both the hold
+         (0) and the release (base rule) keep the declared transition alive, so
+         the cross-fade runs on the way out as well as on the way in. */
+      [data-endfield-balance][data-endfield-credit-mode='ocg'][data-endfield-balance-expanded='1'] > :not([data-endfield-ocg-card]) {
+        opacity: 0;
+      }
+      [data-endfield-balance] [data-endfield-ocg-card] {
         position: absolute;
-        top: calc(100% + 6px);
+        left: 0;
         right: 0;
-        min-width: 168px;
-        flex-direction: column;
-        gap: 5px;
-        padding: 8px 10px;
-        background: rgba(18, 18, 17, 0.94);
-        border: 1px solid rgba(241, 241, 236, 0.16);
-        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.34);
-        font-size: 10px;
-        font-weight: 600;
-        letter-spacing: 0.01em;
-        color: #f1f1ec;
-        white-space: nowrap;
-        pointer-events: none;
-        z-index: 2;
-      }
-      [data-endfield-balance][data-endfield-credit-mode='ocg'][data-endfield-balance-expanded='1'] [data-endfield-ocg-details] {
+        top: 0;
+        bottom: 0;
         display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 7px;
+        padding: 0 22px;
+        overflow: hidden;
+        opacity: 0;
+        pointer-events: none;
       }
-      [data-endfield-balance] [data-endfield-ocg-detail] {
+      [data-endfield-balance][data-endfield-credit-mode='ocg'][data-endfield-balance-expanded='1'] [data-endfield-ocg-card] {
+        opacity: 1;
+      }
+      [data-endfield-balance] [data-endfield-ocg-card-head] {
         display: flex;
         align-items: baseline;
         gap: 8px;
+        white-space: nowrap;
       }
-      [data-endfield-balance] [data-endfield-ocg-detail-key] {
+      [data-endfield-balance] [data-endfield-ocg-card-kicker] {
+        font-size: 9px;
+        font-weight: 500;
+        letter-spacing: 0.02em;
         color: #8d8c88;
       }
-      [data-endfield-balance] [data-endfield-ocg-weekly-pct],
-      [data-endfield-balance] [data-endfield-ocg-monthly-pct] {
+      [data-endfield-balance] [data-endfield-ocg-card-title] {
+        font-size: 11px;
         font-weight: 700;
+        letter-spacing: 0.01em;
+        color: #f1f1ec;
+      }
+      [data-endfield-balance] [data-endfield-ocg-card-row] {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        white-space: nowrap;
+      }
+      [data-endfield-balance] [data-endfield-ocg-card-key] {
+        width: 26px;
+        flex: none;
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        color: #8d8c88;
+      }
+      [data-endfield-balance] [data-endfield-ocg-card-5h-pct],
+      [data-endfield-balance] [data-endfield-ocg-card-weekly-pct],
+      [data-endfield-balance] [data-endfield-ocg-card-monthly-pct] {
+        font-size: 16px;
+        font-weight: 700;
+        color: #f1f1ec;
         font-variant-numeric: tabular-nums;
       }
-      [data-endfield-balance] [data-endfield-ocg-weekly-reset],
-      [data-endfield-balance] [data-endfield-ocg-monthly-reset] {
+      [data-endfield-balance] [data-endfield-ocg-card-5h-reset],
+      [data-endfield-balance] [data-endfield-ocg-card-weekly-reset],
+      [data-endfield-balance] [data-endfield-ocg-card-monthly-reset] {
         margin-left: auto;
-        margin-right: 10px;
         font-size: 9px;
         font-weight: 500;
         color: #a2a1a2;
