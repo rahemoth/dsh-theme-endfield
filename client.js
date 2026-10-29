@@ -8783,11 +8783,14 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
          (height / min-width / padding / --endfield-balance-cap), so the silhouette
          stays a stadium at every frame. The hover pose reuses exactly that
          machinery in the other direction: hovering an OCG pill grows it into a
-         100px card and the three windows render INSIDE it. No scale() — the grow
-         IS the animation, mirroring how the entrance pose shrinks home. */
+         126px card and the three windows render INSIDE it. No scale() — the grow
+         IS the animation, mirroring how the entrance pose shrinks home.
+         Geometry: height 126 / cap 63 keeps cap = height/2 on every frame. The
+         card keeps 34px of side padding so the rows never sit against the drawn
+         caps, and the header band is centered as its own lockup. */
       [data-endfield-balance][data-endfield-credit-mode='ocg'][data-endfield-balance-expanded='1'] {
-        --endfield-balance-cap: 50px;
-        height: 100px;
+        --endfield-balance-cap: 63px;
+        height: 126px;
         min-width: min(448px, calc(100vw - 16px));
         padding: 0 22px;
       }
@@ -8806,8 +8809,8 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         display: flex;
         flex-direction: column;
         justify-content: center;
-        gap: 7px;
-        padding: 0 22px;
+        gap: 6px;
+        padding: 10px 34px;
         overflow: hidden;
         opacity: 0;
         pointer-events: none;
@@ -8815,52 +8818,65 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       [data-endfield-balance][data-endfield-credit-mode='ocg'][data-endfield-balance-expanded='1'] [data-endfield-ocg-card] {
         opacity: 1;
       }
+      /* Header lockup: kicker above, title below, both centered — the same
+         stacked lockup the brand pose uses — under a hairline that is inset by
+         the card's own padding, so it never touches the drawn caps. */
       [data-endfield-balance] [data-endfield-ocg-card-head] {
         display: flex;
-        align-items: baseline;
-        gap: 8px;
+        flex-direction: column;
+        align-items: center;
+        gap: 4px;
+        width: 100%;
+        padding-bottom: 6px;
+        border-bottom: 1px solid rgba(241, 241, 236, 0.14);
         white-space: nowrap;
       }
       [data-endfield-balance] [data-endfield-ocg-card-kicker] {
         font-size: 9px;
         font-weight: 500;
-        letter-spacing: 0.02em;
+        letter-spacing: 0.06em;
         color: #8d8c88;
       }
       [data-endfield-balance] [data-endfield-ocg-card-title] {
-        font-size: 11px;
+        font-size: 14px;
         font-weight: 700;
-        letter-spacing: 0.01em;
+        letter-spacing: 0.02em;
         color: #f1f1ec;
       }
+      /* Rows: a 3-column grid (window / remaining share / reset) so every
+         percentage lines up in its own column and every countdown ends on the
+         same right edge, instead of drifting with the number widths. */
       [data-endfield-balance] [data-endfield-ocg-card-row] {
-        display: flex;
+        display: grid;
+        grid-template-columns: 30px 64px 1fr;
         align-items: baseline;
-        gap: 10px;
+        column-gap: 12px;
         white-space: nowrap;
       }
       [data-endfield-balance] [data-endfield-ocg-card-key] {
-        width: 26px;
-        flex: none;
         font-size: 9px;
         font-weight: 600;
-        letter-spacing: 0.02em;
+        letter-spacing: 0.06em;
         color: #8d8c88;
       }
       [data-endfield-balance] [data-endfield-ocg-card-5h-pct],
       [data-endfield-balance] [data-endfield-ocg-card-weekly-pct],
       [data-endfield-balance] [data-endfield-ocg-card-monthly-pct] {
-        font-size: 16px;
+        font-size: 15px;
         font-weight: 700;
+        letter-spacing: 0.01em;
         color: #f1f1ec;
         font-variant-numeric: tabular-nums;
+        font-feature-settings: 'tnum' 1;
+        text-align: right;
       }
       [data-endfield-balance] [data-endfield-ocg-card-5h-reset],
       [data-endfield-balance] [data-endfield-ocg-card-weekly-reset],
       [data-endfield-balance] [data-endfield-ocg-card-monthly-reset] {
-        margin-left: auto;
+        justify-self: end;
         font-size: 9px;
         font-weight: 500;
+        letter-spacing: 0.02em;
         color: #a2a1a2;
         font-variant-numeric: tabular-nums;
       }
