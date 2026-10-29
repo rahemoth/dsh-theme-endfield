@@ -127,6 +127,9 @@ const FIELD_DEFAULTS = {
   thunder: '0',             // 雷霆大字 —— default off
   thunderAnim: '0',         // 大字入场动画 —— default off
   balanceCapsule: '0',      // 顶部余额胶囊 —— default off
+  /* 余额来源 —— auto（跟随当前会话模型：opencode-go 显示 OCG 5h 套餐，其余显示
+     DeepSeek 余额）| deepseek | opencode_go。default auto（升级不改变既有观感）。 */
+  balanceSource: 'auto',
   creditDisplay: 'remaining', // 渠道额度主读数 —— remaining（剩余）| used（已用）
   balanceCapsulePosition: 'center', // 余额胶囊位置 —— center（居中）| left（靠左）| right（靠右）
   balanceCapsuleSidebarHide: '0',   // 防遮挡：侧边栏展开自动隐藏 —— default off

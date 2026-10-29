@@ -283,6 +283,7 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       'dsh-theme-endfield-thunder': 'thunder',
       'dsh-theme-endfield-thunder-anim': 'thunderAnim',
       'dsh-theme-endfield-balance-capsule': 'balanceCapsule',
+      'dsh-theme-endfield-balance-source': 'balanceSource',
       'dsh-theme-endfield-credit-display': 'creditDisplay',
       'dsh-theme-endfield-balance-capsule-position': 'balanceCapsulePosition',
       'dsh-theme-endfield-balance-capsule-sidebar-hide': 'balanceCapsuleSidebarHide',
@@ -383,6 +384,17 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
        are still carried in the payload for future layouts; the capsule shows
        the 5h read because that is the window a coding session burns first. */
     const OCG_PRIMARY_WINDOW = 'rolling'
+    /* 余额来源（设置页「余额来源」下拉）：
+       auto       = 跟随当前会话模型（opencode-go → OCG，其余 → DeepSeek 余额）
+       deepseek   = 固定 DeepSeek 余额
+       opencode_go= 固定 OCG 5h 套餐
+       这是唯一决定胶囊数据源的偏好；provider 只在 auto 下参与判断。 */
+    const BALANCE_SOURCE_KEY = 'balanceSource'
+    const BALANCE_SOURCE_OPTIONS = ['auto', 'deepseek', 'opencode_go']
+    const readBalanceSource = () => {
+      const value = prefsGet(BALANCE_SOURCE_KEY)
+      return BALANCE_SOURCE_OPTIONS.indexOf(value) >= 0 ? value : 'auto'
+    }
     /* 胶囊停靠位与防遮挡的字面量集（设置页下拉与读取器共用） */
     const BALANCE_POSITION_KEY = 'balanceCapsulePosition'
     const BALANCE_POSITION_OPTIONS = ['center', 'left', 'right']
@@ -5184,6 +5196,15 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
        next 60s poll; ordinary publishes keep the fetch throttle. */
     const ocgRefresh = async (force) => {
       if (balanceEl === null) return
+      // An explicit 余额来源 wins over the model directory: the user pinned the
+      // read, so neither the provider nor a missing session may override it.
+      const source = readBalanceSource()
+      if (source !== 'auto') {
+        const active = source === 'opencode_go'
+        if (active !== ocgActive) ocgSetActive(active)
+        if (active) await ocgApply(force === true)
+        return
+      }
       let sessions = null
       try { sessions = ctx.get('sessions') } catch (e) { sessions = null }
       if (!sessions || !sessions.list || typeof sessions.list.getSnapshot !== 'function') return
@@ -5258,6 +5279,11 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
     const creditLastFetch = {}
     const creditsApply = async (provider, force) => {
       if (creditsBusy) return
+      // The pill has one owner: while OCG mode holds it (auto on an
+      // opencode-go session, or a pinned opencode_go source), a channel-credit
+      // answer must not repaint it. The watch keeps running so a provider
+      // switch back to a jet-hub channel re-arms normally.
+      if (ocgActive) return
       let connection = null
       try { connection = ctx.get('connection') } catch (e) { connection = null }
       if (!connection || !connection.rpc || typeof connection.rpc.call !== 'function') return
@@ -8556,6 +8582,11 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       }
       [data-endfield-balance] [data-endfield-ocg-window] {
         display: none;
+        /* The reset countdown is the right-hand read of this mode, exactly where
+           the wallet's 已过/剩余 percentage sits: pushed to the far right by the
+           same auto margin, with a small gap before the dial. */
+        margin-left: auto;
+        margin-right: 6px;
         font-size: 9px;
         font-weight: 500;
         color: #a2a1a2;
@@ -9020,6 +9051,12 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       creditDisplayUsed: '已用',
       creditDisplayHintRemaining: '渠道模式右侧百分比显示「剩余xx%」（剩余/总额度），圆环同步走剩余份额；主数字始终为剩余额度。需渠道报出总额度，否则右侧留空。切换后下次取数生效',
       creditDisplayHintUsed: '渠道模式右侧百分比显示「已用xx%」（已用/总额度），圆环同步走已用份额；主数字始终为剩余额度。需渠道报出总额度，否则右侧留空。切换后下次取数生效',
+      /* 余额来源：决定胶囊读 DeepSeek 钱包还是 OpenCode Go 套餐（5h 窗口）。 */
+      balanceSourceRow: '余额来源',
+      balanceSourceAuto: '自动（跟随模型）',
+      balanceSourceDeepseek: 'DeepSeek 余额',
+      balanceSourceOpencodeGo: 'OpenCode Go 套餐',
+      balanceSourceHint: '自动：当前会话模型是 opencode-go 时显示 OCG 5h 套餐的剩余百分比与重置倒计时，否则显示 DeepSeek 余额；也可固定其中一种。切换立即生效',
       /* 音频通知：播放发生在宿主进程（lib/audio.js），所以这里的每一行都在
          说明「什么时候响」而不是「怎么响」；试听按钮走宿主真实播放链路。 */
       groupAudio: '音频',
@@ -9201,6 +9238,11 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       creditDisplayUsed: 'Used',
       creditDisplayHintRemaining: 'In credits mode the right-hand percentage shows the remaining share (of the reported quota) and the ring sweeps that same remaining share; the lead figure always stays the remaining balance. The slot stays empty when the channel reports no quota; the change applies at the next fetch',
       creditDisplayHintUsed: 'In credits mode the right-hand percentage shows the used share (of the reported quota) and the ring sweeps that same used share; the lead figure always stays the remaining balance. The slot stays empty when the channel reports no quota; the change applies at the next fetch',
+      balanceSourceRow: 'Balance source',
+      balanceSourceAuto: 'Auto (follow model)',
+      balanceSourceDeepseek: 'DeepSeek balance',
+      balanceSourceOpencodeGo: 'OpenCode Go plan',
+      balanceSourceHint: 'Auto: an opencode-go session shows the OCG 5h remaining share and its reset countdown, any other model shows the DeepSeek balance; either read can also be pinned. Switching applies immediately.',
       groupAudio: 'AUDIO',
       audioRow: 'Audio notifications',
       audioOn: 'Turn on',
@@ -9326,6 +9368,7 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
           const [balancePosition, setBalancePosition] = R.useState(readBalanceCapsulePosition())
           const [balanceSidebarHide, setBalanceSidebarHide] = R.useState(isBalanceSidebarHideOn())
           const [balanceHoverHide, setBalanceHoverHide] = R.useState(isBalanceHoverHideOn())
+          const [balanceSource, setBalanceSource] = R.useState(readBalanceSource())
           const [creditDisplay, setCreditDisplay] = R.useState(readCreditDisplay())
           const [palette, setPalette] = R.useState(readPalette())
           const [glass, setGlass] = R.useState(readGlass())
@@ -9667,6 +9710,25 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
             prefsSet(BALANCE_POSITION_KEY, value)
             setBalancePosition(value)
             syncBalanceCapsule()
+          }
+          /* 余额来源 select. Three literal answers to "which read does the pill
+             own", so it is a select like the dock row rather than a toggle. The
+             write is followed by an immediate re-resolve: ocgRefresh re-reads the
+             preference, and balanceFetch refreshes the wallet half so switching
+             back to DeepSeek shows live numbers instead of whatever was cached
+             when the OCG mode took over. */
+          const BALANCE_SOURCE_SELECT_OPTIONS = BALANCE_SOURCE_OPTIONS
+          const BALANCE_SOURCE_LABEL_KEYS = {
+            auto: 'balanceSourceAuto',
+            deepseek: 'balanceSourceDeepseek',
+            opencode_go: 'balanceSourceOpencodeGo',
+          }
+          const setBalanceSourceValue = (value) => {
+            if (BALANCE_SOURCE_SELECT_OPTIONS.indexOf(value) === -1) return
+            prefsSet(BALANCE_SOURCE_KEY, value)
+            setBalanceSource(value)
+            ocgRefresh(true)
+            balanceFetch()
           }
           /* 防遮挡子开关 are polar toggles like the master switch: each writes
              its default-ON field and mirrors into React state. The live capsule
@@ -10192,6 +10254,24 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
                     border: '1px solid var(--dsw-alias-border-l2)', padding: '6px 10px' },
                 }, BALANCE_POSITION_SELECT_OPTIONS.map((value) => R.createElement('option', { key: value, value },
                   t('balancePosition' + value.charAt(0).toUpperCase() + value.slice(1)))))
+              ]),
+              /* --- 余额来源：胶囊读哪一份余额 ---
+                 自动（跟随当前会话模型 opencode-go）/ 固定 DeepSeek 余额 /
+                 固定 OpenCode Go 5h 套餐。写入后立刻重解析并刷新，切换无需重启。 */
+              row('balance-capsule-source', false, [
+                R.createElement('span', { style: labelStyle },
+                  t('balanceSourceRow') + t('sep') + t(BALANCE_SOURCE_LABEL_KEYS[balanceSource]),
+                  R.createElement('span', { style: hintStyle },
+                    t('balanceSourceHint')
+                  )
+                ),
+                R.createElement('select', {
+                  'aria-label': t('balanceSourceRow'), value: balanceSource,
+                  onChange: (event) => setBalanceSourceValue(event.target.value),
+                  style: { color: 'var(--dsw-alias-label-primary)', background: 'var(--dsw-alias-bg-layer-1)',
+                    border: '1px solid var(--dsw-alias-border-l2)', padding: '6px 10px' },
+                }, BALANCE_SOURCE_SELECT_OPTIONS.map((value) => R.createElement('option', { key: value, value },
+                  t(BALANCE_SOURCE_LABEL_KEYS[value]))))
               ]),
               /* --- 防遮挡两个子开关：侧栏展开自动隐藏 / 指针靠近自动隐藏 ---
                  Both ship ON because the遮挡 they answer is what the capsule
