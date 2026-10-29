@@ -4697,6 +4697,10 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
     let balanceShadeEl = null
     let balanceSidebarOpen = false
     let balanceHoverHide = false
+    /* OCG mode replaces "fade away on hover" with "expand a detail card on
+       hover" (it is the one mode with more than one number to show). The state
+       lives here so both the mousemove geometry and the painters can read it. */
+    let balanceExpanded = false
     let balanceHideRaf = 0
     // Non-zero while the brand pose is up: the wall-clock moment it was raised.
     let balanceBootAt = 0
@@ -4764,8 +4768,12 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
     const balanceShadeReason = () => (balanceSidebarOpen || balanceHoverHide ? true : false)
     const balanceShadeApply = () => {
       if (balanceEl === null) return
+      /* Hover is a REASON TO HIDE only outside OCG mode: there the pointer is how
+         the user asks for the weekly/monthly detail card, so the pill must stay
+         (and even highlight) instead of fading out. The sidebar reason is
+         untouched — a push layout still owns that slot. */
       const wantHide = (isBalanceSidebarHideOn() && balanceSidebarOpen)
-        || (isBalanceHoverHideOn() && balanceHoverHide)
+        || (!ocgActive && isBalanceHoverHideOn() && balanceHoverHide)
       if (wantHide) balanceEl.setAttribute('data-endfield-balance-shade', '')
       else balanceEl.removeAttribute('data-endfield-balance-shade')
     }
@@ -4848,10 +4856,41 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
     const BALANCE_HOVER_BOTTOM = 12
     const BALANCE_HOVER_HYSTERESIS_MS = 240
     let balanceHoverUntil = 0
+    /* Expanded OCG card: the detail panel is an absolutely positioned child, so
+       it does not change the pill's own rect. While it is open, the pointer zone
+       is the union of the pill band and the panel box (plus slack) — without the
+       union, moving down onto the card would leave the band and collapse it. */
+    const BALANCE_OCG_PANEL_SLACK = 8
+    const balanceOcgPanelInside = (clientX, clientY) => {
+      if (balanceEl === null || typeof document === 'undefined') return false
+      const panel = balanceEl.querySelector('[data-endfield-ocg-details]')
+      if (!panel) return false
+      const rect = panel.getBoundingClientRect()
+      if (rect.width <= 0 || rect.height <= 0) return false
+      return clientX >= rect.left - BALANCE_OCG_PANEL_SLACK
+        && clientX <= rect.right + BALANCE_OCG_PANEL_SLACK
+        && clientY >= rect.top - BALANCE_OCG_PANEL_SLACK
+        && clientY <= rect.bottom + BALANCE_OCG_PANEL_SLACK
+    }
+    const balanceExpandApply = (want) => {
+      if (want === balanceExpanded) return
+      balanceExpanded = want
+      if (balanceEl === null) return
+      if (want) balanceEl.setAttribute('data-endfield-balance-expanded', '1')
+      else balanceEl.removeAttribute('data-endfield-balance-expanded')
+    }
     const balanceHoverSync = (now) => {
-      const hide = now < balanceHoverUntil
-      if (hide !== balanceHoverHide) {
-        balanceHoverHide = hide
+      const active = now < balanceHoverUntil
+      if (ocgActive) {
+        // In OCG mode hover EXPANDS the detail card instead of hiding the pill:
+        // the pill is the only place the weekly/monthly windows can appear, and a
+        // surface that fades out exactly when the user reaches for it was the
+        // wrong default for a read-only badge.
+        balanceExpandApply(active)
+        return
+      }
+      if (active !== balanceHoverHide) {
+        balanceHoverHide = active
         balanceShadeApply()
       }
     }
@@ -4862,10 +4901,12 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       if (clientX === null || clientY === null) return
       const rect = balanceEl.getBoundingClientRect()
       if (rect.width <= 0) return
-      const inside = clientX >= rect.left + rect.width / 2 - BALANCE_HOVER_HALF_W
+      const insideBand = clientX >= rect.left + rect.width / 2 - BALANCE_HOVER_HALF_W
         && clientX <= rect.left + rect.width / 2 + BALANCE_HOVER_HALF_W
         && clientY >= rect.top + BALANCE_HOVER_TOP
         && clientY <= rect.bottom + BALANCE_HOVER_BOTTOM
+      const inside = insideBand
+        || (ocgActive && balanceExpanded && balanceOcgPanelInside(clientX, clientY))
       const now = Date.now()
       if (inside) balanceHoverUntil = now + BALANCE_HOVER_HYSTERESIS_MS
       if (balanceHideRaf !== 0 || typeof cancelAnimationFrame !== 'function') {
@@ -4925,6 +4966,7 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       balanceShadeEl = null
       balanceSidebarOpen = false
       balanceHoverHide = false
+      balanceExpanded = false
       balanceHoverUntil = 0
       if (balanceHideRaf !== 0 && typeof cancelAnimationFrame === 'function') {
         try { cancelAnimationFrame(balanceHideRaf) } catch (e) { /* already gone */ }
@@ -5090,6 +5132,66 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       return ocgWindows.find((w) => w && (w.key === OCG_PRIMARY_WINDOW || w.label === '5h')) || ocgWindows[0] || null
     }
 
+    const ocgWindowByKey = (key) => {
+      if (!Array.isArray(ocgWindows)) return null
+      return ocgWindows.find((w) => w && w.key === key) || null
+    }
+
+    /* resetsAt is whatever the provider sent: an epoch in ms, an epoch in
+       seconds, or an ISO string. One parser for the pill and the detail rows so
+       the two can never disagree about when a window refills. */
+    const ocgResetInstant = (window) => {
+      if (!window || window.resetAt === null || window.resetAt === undefined) return 0
+      const parsed = typeof window.resetAt === 'number'
+        ? (window.resetAt > 1e12 ? window.resetAt : window.resetAt * 1000)
+        : Date.parse(String(window.resetAt))
+      return Number.isFinite(parsed) ? parsed : 0
+    }
+
+    /* Detail rows read as a duration, not a clock: the weekly/monthly windows are
+       days away, where "3天5小时" is honest and "77:12:33" is noise. Under a day
+       it falls back to the same hh:mm:ss the pill uses. */
+    const ocgFormatSpan = (ms) => {
+      if (!(ms > 0)) return ''
+      const total = Math.floor(ms / 1000)
+      const days = Math.floor(total / 86400)
+      if (days > 0) {
+        const hours = Math.floor((total % 86400) / 3600)
+        return days + '天' + hours + '小时'
+      }
+      return balanceFormatCountdown(ms)
+    }
+
+    /* The weekly/monthly rows live in the hover detail card. Repainting them on
+       every tick keeps the duration honest while the card is open; the writes are
+       plain textContent on four nodes, cheap enough for the 1s heartbeat. */
+    const ocgPaintDetails = () => {
+      if (balanceEl === null || typeof document === 'undefined') return
+      const setText = (attr, text) => {
+        const node = balanceEl.querySelector('[' + attr + ']')
+        if (node) node.textContent = text
+      }
+      for (const key of ['weekly', 'monthly']) {
+        const window = ocgWindowByKey(key)
+        let pct = null
+        if (window) {
+          if (Number.isFinite(window.remainPct)) pct = window.remainPct
+          else if (Number.isFinite(window.usedPct)) pct = 100 - window.usedPct
+        }
+        setText('data-endfield-ocg-' + key + '-pct', pct === null ? '--' : pct + '%')
+        const resetAt = ocgResetInstant(window)
+        setText('data-endfield-ocg-' + key + '-reset', resetAt ? '重置 ' + ocgFormatSpan(resetAt - Date.now()) : '')
+      }
+    }
+
+    /* 1s heartbeat while OCG owns the pill: the 5h countdown on the row and the
+       weekly/monthly durations inside the (possibly open) detail card. */
+    const ocgPaintTick = () => {
+      if (!ocgActive) return
+      ocgPaintCountdown()
+      ocgPaintDetails()
+    }
+
     const ocgPaintCountdown = () => {
       if (balanceEl === null || typeof document === 'undefined') return
       const node = balanceEl.querySelector('[data-endfield-ocg-remain]')
@@ -5129,6 +5231,7 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       }
       balanceEl.setAttribute('data-endfield-credit-mode', 'ocg')
       ocgPaintCountdown()
+      ocgPaintDetails()
     }
 
     const ocgPaintIdle = () => ocgPaint({ int: '--', sweepPct: NaN })
@@ -5156,6 +5259,11 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       ocgActive = active
       ocgWindows = null
       ocgResetAt = 0
+      // The hover behaviour belongs to the mode: expansion only exists while OCG
+      // owns the pill, and a hover-hide left over from wallet mode must not carry
+      // into it (balanceShadeApply below re-derives the shade from scratch).
+      balanceExpandApply(false)
+      balanceHoverHide = false
       if (active) {
         // Entering the mode always fetches once: the pill must not sit on -- for
         // a minute because a previous visit's throttle stamp is still fresh.
@@ -5167,6 +5275,7 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         // ocgApply re-reads ocgActive on arrival.
         ocgLastFetchAt = 0
       }
+      balanceShadeApply()
     }
 
     const ocgApply = async (force) => {
@@ -5190,14 +5299,7 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         const remain = window && Number.isFinite(window.remainPct)
           ? window.remainPct
           : (window && Number.isFinite(window.usedPct) ? 100 - window.usedPct : null)
-        let resetAt = 0
-        if (window && window.resetAt !== null && window.resetAt !== undefined) {
-          const parsed = typeof window.resetAt === 'number'
-            ? (window.resetAt > 1e12 ? window.resetAt : window.resetAt * 1000)
-            : Date.parse(String(window.resetAt))
-          if (Number.isFinite(parsed)) resetAt = parsed
-        }
-        ocgResetAt = resetAt
+        ocgResetAt = ocgResetInstant(window)
         ocgPaint({ int: remain === null ? '--' : String(remain), sweepPct: remain === null ? NaN : remain })
         ocgLastFetchAt = Date.now()
       } catch (e) {
@@ -5845,6 +5947,22 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         '<span data-endfield-balance-brand-kicker>/// DEEPSEEK API</span>' +
         '<span data-endfield-balance-brand-title>DeepSeek 当前低谷</span>' +
         '</span>' +
+        '</span>' +
+        // Hover detail card (OCG only): the weekly/monthly windows the one-line
+        // pill has no room for. Absolutely positioned under the pill (so opening
+        // it never re-lays-out the capsule) and shown by the expanded attribute
+        // the hover geometry sets; the four values are painted by ocgPaintDetails.
+        '<span data-endfield-ocg-details>' +
+        '<span data-endfield-ocg-detail>' +
+        '<span data-endfield-ocg-detail-key>周</span>' +
+        '<span data-endfield-ocg-weekly-pct>--</span>' +
+        '<span data-endfield-ocg-weekly-reset></span>' +
+        '</span>' +
+        '<span data-endfield-ocg-detail>' +
+        '<span data-endfield-ocg-detail-key>月</span>' +
+        '<span data-endfield-ocg-monthly-pct>--</span>' +
+        '<span data-endfield-ocg-monthly-reset></span>' +
+        '</span>' +
         '</span>'
       document.body.appendChild(el)
       balanceEl = el
@@ -5884,10 +6002,11 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       balancePaintWindow()
       if (typeof setInterval === 'function') {
         // The 1s tick repaints the wallet's pricing window and the OCG reset
-        // countdown; each painter early-returns for the mode it does not own.
+        // countdown + detail durations; each painter early-returns for the mode
+        // it does not own.
         balanceTimer = setInterval(() => {
           balancePaintWindow()
-          if (ocgActive) ocgPaintCountdown()
+          ocgPaintTick()
         }, BALANCE_TICK_MS)
         // One poll heartbeat drives every read: the wallet fetch, a channel
         // re-resolve and the OCG quota read. The credit half is throttled
@@ -8657,6 +8776,57 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       }
       [data-endfield-balance] [data-endfield-ocg-remain] {
         margin-left: 2px;
+        font-variant-numeric: tabular-nums;
+      }
+      /* ---------- OCG hover detail card ----------
+         Opened by data-endfield-balance-expanded (set from the mousemove
+         geometry). Absolute so opening it never re-flows the 32px pill; it hangs
+         under the pill and right-aligns to the pill's right edge. The hover zone
+         includes this box while it is open, otherwise moving down onto the card
+         would leave the pill band and immediately collapse it. */
+      [data-endfield-balance] [data-endfield-ocg-details] {
+        display: none;
+        position: absolute;
+        top: calc(100% + 6px);
+        right: 0;
+        min-width: 168px;
+        flex-direction: column;
+        gap: 5px;
+        padding: 8px 10px;
+        background: rgba(18, 18, 17, 0.94);
+        border: 1px solid rgba(241, 241, 236, 0.16);
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.34);
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+        color: #f1f1ec;
+        white-space: nowrap;
+        pointer-events: none;
+        z-index: 2;
+      }
+      [data-endfield-balance][data-endfield-credit-mode='ocg'][data-endfield-balance-expanded='1'] [data-endfield-ocg-details] {
+        display: flex;
+      }
+      [data-endfield-balance] [data-endfield-ocg-detail] {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+      }
+      [data-endfield-balance] [data-endfield-ocg-detail-key] {
+        color: #8d8c88;
+      }
+      [data-endfield-balance] [data-endfield-ocg-weekly-pct],
+      [data-endfield-balance] [data-endfield-ocg-monthly-pct] {
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+      }
+      [data-endfield-balance] [data-endfield-ocg-weekly-reset],
+      [data-endfield-balance] [data-endfield-ocg-monthly-reset] {
+        margin-left: auto;
+        margin-right: 10px;
+        font-size: 9px;
+        font-weight: 500;
+        color: #a2a1a2;
         font-variant-numeric: tabular-nums;
       }
       /* 低谷时段剩余hh:mm:ss — one grey caption, not three tokens. */
