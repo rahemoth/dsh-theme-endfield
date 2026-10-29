@@ -5105,9 +5105,22 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         const node = balanceEl.querySelector('[' + attr + ']')
         if (node) node.textContent = text
       }
+      setText('data-endfield-ocg-title', 'OpenCode 额度剩余')
       setText('data-endfield-ocg-label', '5h')
       setText('data-endfield-ocg-int', paint.int)
       setText('data-endfield-ocg-unit', '%')
+      /* The entrance pose (brand plate) speaks the SAME read while OCG owns the
+         pill: the DeepSeek wording underneath would claim a peak/off-peak state
+         this mode has nothing to do with. Both nodes are inert outside the boot
+         animation, so keeping them in sync costs one text write per paint. */
+      const kicker = balanceEl.querySelector('[data-endfield-balance-brand-kicker]')
+      if (kicker) kicker.textContent = '/// OPENCODE GO'
+      const brandTitle = balanceEl.querySelector('[data-endfield-balance-brand-title]')
+      if (brandTitle) {
+        brandTitle.textContent = paint.int === '--'
+          ? 'OpenCode 额度剩余 --'
+          : 'OpenCode 额度剩余 ' + paint.int + '%'
+      }
       if (typeof balanceEl.style?.setProperty === 'function') {
         balanceEl.style.setProperty(
           '--endfield-balance-sweep',
@@ -5121,13 +5134,21 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
     const ocgPaintIdle = () => ocgPaint({ int: '--', sweepPct: NaN })
 
     /* Hand the pill back after OCG loses the session: the last wallet read is
-       repainted when there is one, otherwise the seed -- is the honest state. */
+       repainted when there is one, otherwise the seed -- is the honest state.
+       The brand plate is put back to the wallet wording here (kicker) and by the
+       wallet painter itself (title/state) so a late boot pose cannot keep
+       claiming OpenCode Go. */
     const ocgRelease = () => {
       if (balanceEl === null) return
+      const kicker = balanceEl.querySelector('[data-endfield-balance-brand-kicker]')
+      if (kicker) kicker.textContent = '/// DEEPSEEK API'
       if (creditProvider !== null) { creditPaintIdle(); return }
       balanceEl.setAttribute('data-endfield-credit-mode', 'wallet')
       if (balanceLastWallet) balancePaint(balanceLastWallet)
       else balancePaint({ currency: '', int: '--', frac: '' })
+      // Repaint the wallet's pricing window/title immediately (the 1s tick would
+      // otherwise leave the OCG title up for up to a second).
+      balancePaintWindow()
     }
 
     const ocgSetActive = (active) => {
@@ -5782,8 +5803,10 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         // The OpenCode Go read is the third state of the same attribute: the 5h
         // window's remaining share as the big number, and its refill countdown
         // as the middle caption (the wallet's pricing run is hidden in this
-        // mode). No unit tag beyond % — the window label is the unit.
+        // mode). The grey title names what the number IS — without it a bare
+        // "5h 62%" reads like a duration rather than a remaining quota.
         '<span data-endfield-ocg-money>' +
+        '<span data-endfield-ocg-title>OpenCode 额度剩余</span>' +
         '<span data-endfield-ocg-label>5h</span>' +
         '<span data-endfield-ocg-int>--</span>' +
         '<span data-endfield-ocg-unit>%</span>' +
@@ -8603,6 +8626,14 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       }
       [data-endfield-balance][data-endfield-credit-mode='ocg'] [data-endfield-ocg-window] {
         display: inline;
+      }
+      [data-endfield-balance] [data-endfield-ocg-title] {
+        margin-right: 5px;
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        color: #8d8c88;
+        white-space: nowrap;
       }
       [data-endfield-balance] [data-endfield-ocg-label] {
         margin-right: 4px;

@@ -10,7 +10,11 @@
 |---|---|
 | 自动（默认） | 当前会话模型是 `opencode-go` 时显示 OCG，其余显示 DeepSeek 余额 |
 | DeepSeek 余额 | 固定原行为：余额 + 峰谷时段（装了 `dsh-codearts-auth` 时仍是渠道额度模式） |
-| OpenCode Go 套餐 | 固定显示 5h 窗口：`5h 剩余62%` + `重置1:01:01`，圆环同步走剩余份额 |
+| OpenCode Go 套餐 | 固定显示 5h 窗口：`OpenCode 额度剩余 5h 62%` + `重置1:01:01`，圆环同步走剩余份额 |
+
+OCG 模式下，胶囊的入场动画（brand pose）也换成同一读数：kicker 为 `/// OPENCODE GO`，
+标题为 `OpenCode 额度剩余 62%`（取数前为 `--`）；切回余额模式时 kicker 还原为
+`/// DEEPSEEK API`，标题由钱包绘制器接管，不会残留 OCG 字样。
 
 **实现**（两半，都围绕既有 `data-endfield-credit-mode` 属性增加第三种状态 `ocg`）：
 
