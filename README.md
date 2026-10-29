@@ -1,5 +1,10 @@
 # dsh-theme-endfield
 
+> **本仓库是本地分支（personal fork）。** 上游为 [ymh0000123/dsh-theme-endfield](https://github.com/ymh0000123/dsh-theme-endfield)；
+> 本地在 1.2.3 基础上新增了「顶部余额胶囊 · OpenCode Go 套餐」模式（5h/周/月额度、
+> 悬停放大卡片、`余额来源` 设置），实现与回退说明见 [LOCAL-CHANGES.md](LOCAL-CHANGES.md)。
+> 上游其余功能与上游一致。
+
 参考《明日方舟：终末地》官网风格的 DSH Web 主题插件：奶油纸底、墨黑文字、信号黄／武陵青强调色、全直角工业编辑风。
 
 - **Client 侧**（`client.js`）：通过主题令牌与样式覆盖界面。
