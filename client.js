@@ -8843,21 +8843,23 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         letter-spacing: 0.02em;
         color: #f1f1ec;
       }
-      /* Rows: a 3-column grid (window / remaining share / reset) so every
-         percentage lines up in its own column and every countdown ends on the
-         same right edge, instead of drifting with the number widths. */
+      /* Rows: a 3-column grid (window / remaining share / reset). The share
+         column hugs the label (8px) instead of sitting in a fixed far column —
+         the label+number pair reads as one token, and every countdown still ends
+         on the same right edge. */
       [data-endfield-balance] [data-endfield-ocg-card-row] {
         display: grid;
-        grid-template-columns: 30px 64px 1fr;
+        grid-template-columns: 34px auto 1fr;
         align-items: baseline;
-        column-gap: 12px;
+        column-gap: 8px;
         white-space: nowrap;
       }
       [data-endfield-balance] [data-endfield-ocg-card-key] {
-        font-size: 9px;
-        font-weight: 600;
-        letter-spacing: 0.06em;
-        color: #8d8c88;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        color: #f1f1ec;
+        text-transform: uppercase;
       }
       [data-endfield-balance] [data-endfield-ocg-card-5h-pct],
       [data-endfield-balance] [data-endfield-ocg-card-weekly-pct],
@@ -8868,7 +8870,7 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         color: #f1f1ec;
         font-variant-numeric: tabular-nums;
         font-feature-settings: 'tnum' 1;
-        text-align: right;
+        text-align: left;
       }
       [data-endfield-balance] [data-endfield-ocg-card-5h-reset],
       [data-endfield-balance] [data-endfield-ocg-card-weekly-reset],
