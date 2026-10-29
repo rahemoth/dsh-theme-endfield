@@ -4855,13 +4855,57 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
     const BALANCE_HOVER_TOP = -8
     const BALANCE_HOVER_BOTTOM = 12
     const BALANCE_HOVER_HYSTERESIS_MS = 240
+    /* Must match the expanded rule's height in the OCG hover CSS (the cached hit
+       box is grown to this on the first frame of the morph). */
+    const BALANCE_EXPANDED_HEIGHT = 126
     let balanceHoverUntil = 0
+    /* The hover band is measured ONCE per stable geometry, not per mousemove.
+       During the grow/shrink transition a per-event getBoundingClientRect()
+       forces a synchronous layout every mouse event — with the 420ms morph in
+       flight that was exactly the stutter on the way in and out. The cached rect
+       is refreshed at mount, on resize, and shortly after each state change (the
+       transition end), so hit-testing stays a pure arithmetic test. */
+    let balanceHoverRect = null
+    let balanceHoverRectTimer = null
+    const balanceHoverRectRefresh = () => {
+      if (balanceEl === null || typeof balanceEl.getBoundingClientRect !== 'function') {
+        balanceHoverRect = null
+        return
+      }
+      try { balanceHoverRect = balanceEl.getBoundingClientRect() } catch (e) { balanceHoverRect = null }
+    }
+    const balanceHoverRectSchedule = (delay) => {
+      if (balanceEl === null || typeof setTimeout !== 'function') return
+      if (balanceHoverRectTimer !== null && typeof clearTimeout === 'function') clearTimeout(balanceHoverRectTimer)
+      balanceHoverRectTimer = setTimeout(() => {
+        balanceHoverRectTimer = null
+        balanceHoverRectRefresh()
+      }, delay)
+    }
     const balanceExpandApply = (want) => {
       if (want === balanceExpanded) return
       balanceExpanded = want
       if (balanceEl === null) return
       if (want) balanceEl.setAttribute('data-endfield-balance-expanded', '1')
       else balanceEl.removeAttribute('data-endfield-balance-expanded')
+      /* Grow the CACHED hit box to the target height immediately: the real rect
+         is still 32px tall for the first frames of the morph, so a pointer that
+         moves down onto the growing card would otherwise read as "outside" and
+         collapse it again after the hysteresis. Width is left alone — the band is
+         ±160px wide, so its growth never changes the verdict. */
+      if (want && balanceHoverRect !== null) {
+        const bottom = balanceHoverRect.top + Math.max(balanceHoverRect.height, BALANCE_EXPANDED_HEIGHT)
+        balanceHoverRect = {
+          left: balanceHoverRect.left,
+          top: balanceHoverRect.top,
+          right: balanceHoverRect.right,
+          width: balanceHoverRect.width,
+          bottom,
+          height: bottom - balanceHoverRect.top,
+        }
+      }
+      // Re-measure the true box once the morph settles.
+      balanceHoverRectSchedule(300)
     }
     const balanceHoverSync = (now) => {
       const active = now < balanceHoverUntil
@@ -4883,25 +4927,29 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       const clientX = ev && typeof ev.clientX === 'number' ? ev.clientX : null
       const clientY = ev && typeof ev.clientY === 'number' ? ev.clientY : null
       if (clientX === null || clientY === null) return
-      const rect = balanceEl.getBoundingClientRect()
-      if (rect.width <= 0) return
-      // The band is recomputed from the LIVE rect on every move, so while the
-      // capsule is grown into its hover card the taller box is its own hover
-      // zone — moving around inside the card keeps it open, leaving it collapses.
+      // No layout read here: the hit box is cached (see balanceHoverRectRefresh).
+      // The cached rect follows the grown card after the morph settles, so moving
+      // inside the card keeps it open and leaving both boxes collapses it.
+      const rect = balanceHoverRect
+      if (rect === null || rect.width <= 0) return
       const inside = clientX >= rect.left + rect.width / 2 - BALANCE_HOVER_HALF_W
         && clientX <= rect.left + rect.width / 2 + BALANCE_HOVER_HALF_W
         && clientY >= rect.top + BALANCE_HOVER_TOP
         && clientY <= rect.bottom + BALANCE_HOVER_BOTTOM
       const now = Date.now()
       if (inside) balanceHoverUntil = now + BALANCE_HOVER_HYSTERESIS_MS
-      if (balanceHideRaf !== 0 || typeof cancelAnimationFrame !== 'function') {
-        balanceHoverSync(now)
+      /* One state write per animation frame is enough: a burst of mousemove
+         events inside the band must not each run the expand/shrink bookkeeping.
+         When rAF exists, coalesce; otherwise (stub hosts) run inline. */
+      if (typeof requestAnimationFrame === 'function' && typeof cancelAnimationFrame === 'function') {
+        if (balanceHideRaf !== 0) return
+        balanceHideRaf = requestAnimationFrame(() => {
+          balanceHideRaf = 0
+          balanceHoverSync(Date.now())
+        })
         return
       }
-      balanceHideRaf = requestAnimationFrame(() => {
-        balanceHideRaf = 0
-        balanceHoverSync(Date.now())
-      })
+      balanceHoverSync(now)
     }
 
     const destroyBalanceCapsule = () => {
@@ -4957,8 +5005,14 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         try { cancelAnimationFrame(balanceHideRaf) } catch (e) { /* already gone */ }
       }
       balanceHideRaf = 0
+      balanceHoverRect = null
+      if (balanceHoverRectTimer !== null && typeof clearTimeout === 'function') {
+        clearTimeout(balanceHoverRectTimer)
+        balanceHoverRectTimer = null
+      }
       if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
         try { window.removeEventListener('mousemove', balanceOnMouseMove) } catch (e) { /* not attached */ }
+        try { window.removeEventListener('resize', balanceHoverRectRefresh) } catch (e) { /* not attached */ }
       }
       if (balanceEl !== null && balanceEl.parentNode) {
         try { balanceEl.parentNode.removeChild(balanceEl) } catch (e) { /* already gone */ }
@@ -5978,8 +6032,18 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       balanceSidebarOpen = false
       balanceHoverHide = false
       balanceWatchSidebar()
+      // Cache the hover box after the first layout frame, and again after the boot
+      // pose has collapsed (72 -> 32 changes the rect). A resize invalidates it.
+      balanceHoverRect = null
+      if (typeof requestAnimationFrame === 'function') {
+        try { requestAnimationFrame(balanceHoverRectRefresh) } catch (e) { balanceHoverRectRefresh() }
+      } else {
+        balanceHoverRectRefresh()
+      }
+      balanceHoverRectSchedule(600)
       if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
         try { window.addEventListener('mousemove', balanceOnMouseMove) } catch (e) { /* stub */ }
+        try { window.addEventListener('resize', balanceHoverRectRefresh) } catch (e) { /* stub */ }
       }
       if (bootAnimated) {
         // Raised before the first paint, so the pill never flashes the settled
@@ -8779,20 +8843,26 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         font-variant-numeric: tabular-nums;
       }
       /* ---------- OCG hover pose: the row GROWS into a card ----------
-         The boot pose morphs the capsule 72px -> 32px on one declared transition
-         (height / min-width / padding / --endfield-balance-cap), so the silhouette
-         stays a stadium at every frame. The hover pose reuses exactly that
-         machinery in the other direction: hovering an OCG pill grows it into a
-         126px card and the three windows render INSIDE it. No scale() — the grow
-         IS the animation, mirroring how the entrance pose shrinks home.
+         Shorter morph for a POINTER-driven change: the boot pose's 420ms is the
+         entrance's own rhythm, but a hover must answer in about a quarter second
+         or it reads as lag. The padding inset is deliberately left out of the
+         list (the row content is invisible while expanded, so it has nothing to
+         animate) — that drops a per-frame child reflow from every morph frame.
          Geometry: height 126 / cap 63 keeps cap = height/2 on every frame. The
          card keeps 34px of side padding so the rows never sit against the drawn
          caps, and the header band is centered as its own lockup. */
+      [data-endfield-balance][data-endfield-credit-mode='ocg'] {
+        transition:
+          height 260ms cubic-bezier(0.22, 0.72, 0.2, 1),
+          min-width 260ms cubic-bezier(0.22, 0.72, 0.2, 1),
+          --endfield-balance-cap 260ms cubic-bezier(0.22, 0.72, 0.2, 1),
+          opacity 140ms ease,
+          transform 200ms cubic-bezier(0.22, 0.72, 0.2, 1);
+      }
       [data-endfield-balance][data-endfield-credit-mode='ocg'][data-endfield-balance-expanded='1'] {
         --endfield-balance-cap: 63px;
         height: 126px;
         min-width: min(448px, calc(100vw - 16px));
-        padding: 0 22px;
       }
       /* The row content steps aside while the card holds the box. Both the hold
          (0) and the release (base rule) keep the declared transition alive, so
