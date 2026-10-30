@@ -189,6 +189,13 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
          /theme-endfield/balance route. Ships OFF so an upgrade never adds a
          floating element the user did not ask for. */
       balanceCapsule: '0',
+      /* 余额来源 —— 必须和宿主 FIELD_DEFAULTS 的字段同名同默认值出现在这里：本表
+         既是 section 解析的键集合（prefsResolveSection 只遍历它的键），也是传输
+         未就绪时的回落。漏掉这一行会让宿主已保存的 'opencode_go' 在解析时被丢掉，
+         读回永远落到默认 'auto' —— 表现就是「设置保存了，但每次重启又变回
+         DeepSeek 余额，要手动切一次」（手动切之所以生效是因为 prefsLocal 的会话内
+         覆盖层还记得这次编辑，而覆盖层不跨刷新）。 */
+      balanceSource: 'auto',
       /* 渠道额度胶囊的右侧百分比读数选「已用」还是「剩余」——两个值都有真实语义，
          不存在默认就错的答案，所以默认 used（与插件自身徽章一致的读法）。
          仅影响 credits 模式的右侧百分比槽位；左侧主数字始终为剩余额度。 */
@@ -4687,6 +4694,10 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
     let balanceTimer = null
     let balancePollTimer = null
     let balanceBusy = false
+    /* The prefs subscription installed by the capsule mount: the settings section
+       hydrates after first paint, so the mount-time source read sees the schema
+       default. Destroyed with the capsule. */
+    let balancePrefsUnsub = null
     /* ---------- 防遮挡（sidebar 展开 / 鼠标靠近）运行时状态 ----------
        balanceShadeEl 是被监听的布局列（左侧 `_sidebarCol`，靠边停靠时换成
        `_rightbarCol`），null 表示尚未发现或胶囊不在 DOM。观察器只在胶囊存在时
@@ -4730,6 +4741,8 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
     let ocgWindows = null
     let ocgWatchedStore = null
     let ocgUnsub = null
+    let ocgResolveRetryTimer = null
+    let ocgResolveRetryCount = 0
     let balanceLastWallet = null
     /* Rate limiting the usage.badge calls. Two refresh paths feed creditsApply
        — the shared 60s poll and every model-directory publish — and without a
@@ -5014,6 +5027,11 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
         try { window.removeEventListener('mousemove', balanceOnMouseMove) } catch (e) { /* not attached */ }
         try { window.removeEventListener('resize', balanceHoverRectRefresh) } catch (e) { /* not attached */ }
       }
+      if (typeof balancePrefsUnsub === 'function') {
+        try { balancePrefsUnsub() } catch (e) { /* already gone */ }
+        balancePrefsUnsub = null
+      }
+      ocgClearResolveRetry()
       if (balanceEl !== null && balanceEl.parentNode) {
         try { balanceEl.parentNode.removeChild(balanceEl) } catch (e) { /* already gone */ }
       }
@@ -5358,6 +5376,32 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       }
     }
 
+    /* The auto branch needs the session list and the model directory, and both
+       arrive asynchronously after the capsule mounts. A handful of bounded
+       re-resolves closes that gap: without them the pill sat on the DeepSeek
+       wallet until the next 60s poll whenever boot won the race. */
+    const OCG_RESOLVE_RETRY_MS = 900
+    const OCG_RESOLVE_RETRY_LIMIT = 8
+    const ocgClearResolveRetry = () => {
+      ocgResolveRetryCount = 0
+      if (ocgResolveRetryTimer !== null && typeof clearTimeout === 'function') {
+        clearTimeout(ocgResolveRetryTimer)
+        ocgResolveRetryTimer = null
+      }
+    }
+    const ocgScheduleResolveRetry = () => {
+      if (typeof setTimeout !== 'function') return
+      if (ocgResolveRetryTimer !== null) return
+      if (ocgResolveRetryCount >= OCG_RESOLVE_RETRY_LIMIT) return
+      ocgResolveRetryCount += 1
+      ocgResolveRetryTimer = setTimeout(() => {
+        ocgResolveRetryTimer = null
+        // Re-read the preference too: a section that hydrated in between may have
+        // pinned a source, which the failed auto pass could not see.
+        ocgRefresh(false)
+      }, OCG_RESOLVE_RETRY_MS)
+    }
+
     /* Read the SAME session directory the credits mode watches and decide which
        provider owns the pill. A switch (or the first load) repaints before the
        next 60s poll; ordinary publishes keep the fetch throttle. */
@@ -5367,6 +5411,9 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       // read, so neither the provider nor a missing session may override it.
       const source = readBalanceSource()
       if (source !== 'auto') {
+        // A pinned source is an authoritative answer whatever the services say:
+        // stop the boot-race retries instead of letting one fire later.
+        ocgClearResolveRetry()
         const active = source === 'opencode_go'
         if (active !== ocgActive) ocgSetActive(active)
         if (active) await ocgApply(force === true)
@@ -5374,17 +5421,17 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       }
       let sessions = null
       try { sessions = ctx.get('sessions') } catch (e) { sessions = null }
-      if (!sessions || !sessions.list || typeof sessions.list.getSnapshot !== 'function') return
+      if (!sessions || !sessions.list || typeof sessions.list.getSnapshot !== 'function') { ocgScheduleResolveRetry(); return }
       let snap = null
       try { snap = sessions.list.getSnapshot() } catch (e) { snap = null }
       const id = snap ? thunderCurrentId(snap) : undefined
-      if (id === undefined || id === null) { ocgSetActive(false); return }
+      if (id === undefined || id === null) { ocgSetActive(false); ocgScheduleResolveRetry(); return }
       let directories = null
       try { directories = ctx.get('modelDirectories') } catch (e) { directories = null }
-      if (!directories || typeof directories.directoryFor !== 'function') return
+      if (!directories || typeof directories.directoryFor !== 'function') { ocgScheduleResolveRetry(); return }
       let directory = null
       try { directory = directories.directoryFor(id) } catch (e) { directory = null }
-      if (!directory || !directory.store) return
+      if (!directory || !directory.store) { ocgScheduleResolveRetry(); return }
       if (ocgWatchedStore !== directory.store) {
         if (typeof ocgUnsub === 'function') { try { ocgUnsub() } catch (e) { /* gone */ } }
         ocgUnsub = null
@@ -5400,6 +5447,8 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       try { state = directory.store.getSnapshot() } catch (e) { state = null }
       const provider = state && state.current ? state.current.provider : undefined
       const active = typeof provider === 'string' && (provider === OCG_PROVIDER || provider.indexOf(OCG_PROVIDER) === 0)
+      // The directory answered (whatever it said): the boot race is over.
+      ocgClearResolveRetry()
       if (active !== ocgActive) ocgSetActive(active)
       if (active) await ocgApply(force === true)
     }
@@ -6044,6 +6093,20 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
       if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
         try { window.addEventListener('mousemove', balanceOnMouseMove) } catch (e) { /* stub */ }
         try { window.addEventListener('resize', balanceHoverRectRefresh) } catch (e) { /* stub */ }
+      }
+      /* The settings section hydrates AFTER the first paint on a real page load:
+         the ocgRefresh() below therefore reads the schema default ('auto') and a
+         pinned OpenCode Go install paints the DeepSeek wallet. The stored 余额来源
+         arrives through prefsEmit (prefsSubscribe) — re-resolve on that event so
+         the pill lands on the right mode within a frame instead of after the 60s
+         poll. Passing force=false keeps the read throttle: a preference echo must
+         not fire an extra route call when the numbers are already fresh. */
+      if (typeof prefsSubscribe === 'function') {
+        try {
+          balancePrefsUnsub = prefsSubscribe(() => {
+            if (balanceEl !== null) ocgRefresh(false)
+          })
+        } catch (e) { balancePrefsUnsub = null }
       }
       if (bootAnimated) {
         // Raised before the first paint, so the pill never flashes the settled
@@ -9765,6 +9828,10 @@ function apply(ctx) {    // Idempotency: the installed bundle can be applied mor
               setThunderAnim(isThunderAnimOn())
               setBalanceOn(isBalanceCapsuleOn())
               setBalancePosition(readBalanceCapsulePosition())
+              // The select seeds itself from the same store: without this it froze
+              // at the schema default when the section arrived after mount, which
+              // read as "余额来源 didn't save".
+              setBalanceSource(readBalanceSource())
               setBalanceSidebarHide(isBalanceSidebarHideOn())
               setBalanceHoverHide(isBalanceHoverHideOn())
               setCreditDisplay(readCreditDisplay())

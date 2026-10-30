@@ -66,6 +66,28 @@ OCG 模式下鼠标靠近**不再淡出**：胶囊会长成一张卡片（32px �
 **语义约定**：接口的 `percent` 是**已用**比例（与鲸鱼挂件一致），胶囊显示的是
 `100 - usedPct`（剩余）。失败画 `--` 而不是 `0`：0 会被误读成"额度用完了"。
 
+## 设置持久化修复（local.9）
+
+「设置里选了 OCG 套餐，重启后又变回 DeepSeek 余额，要手动切一次」的根因是**客户端默认值表漏了字段**：
+
+- 宿主的 `FIELD_DEFAULTS` 里有 `balanceSource`（volatile Config，写入会进 `cordis.patch.yml`），
+  所以设置其实**保存成功了**；
+- 但浏览器端 `PREFS_FIELD_DEFAULTS` 没有这一项，而 section 解析
+  （`prefsResolveSection`）只遍历这张表的键 —— 宿主送来的 `opencode_go` 在解析时被丢掉，
+  读回永远落到默认 `auto`（就是 DS 余额）；
+- 手动切一次之所以当场生效，是因为 `prefsLocal` 的会话内覆盖层还记得这次编辑，
+  而覆盖层不跨刷新。
+
+修法（三层，都是防同类问题复发）：
+
+1. `PREFS_FIELD_DEFAULTS` 补上 `balanceSource: 'auto'`（本表必须与宿主 35 个字段一一对应，
+   已用脚本核对：missing 0 / extra 0）；
+2. 胶囊挂载时订阅 `prefsSubscribe`：设置 section 在首帧之后才从宿主送达，挂载时读到的是
+   默认值，section 到达的 `prefsEmit` 会再跑一次 `ocgRefresh`，让固定的余额来源立刻生效，
+   不再等 60s 轮询；
+3. `auto` 分支在 sessions / modelDirectories 还没就绪时做有界重试（900ms × 8 次），
+   避免开机竞态把胶囊钉死在钱包读数上。
+
 ## 安装 / 回退
 
 ```powershell
@@ -95,11 +117,12 @@ cmd /c rmdir "%USERPROFILE%\.dsh\profiles\theme-endfield"
   固定来源（`opencode_go` 无会话也进入 / `deepseek` 立即释放 / `auto` 无会话不猜）也覆盖。
 - 悬停展开：单独抽出 hover 几何块测过——带内展开、移到卡片上保持、离开两者收起、
   仅卡片区域不误触发、非 OCG 模式仍走淡出。
-- 真实界面需重启桌面端后观察：设置页「余额来源」下拉、以及 OCG 模式下「重置」靠右对齐。
+- 设置默认值表：`index.js FIELD_DEFAULTS` vs `client.js PREFS_FIELD_DEFAULTS` 键集合比对，
+  35/35 一致（这是 local.9 持久化 bug 的回归护栏）。
+- 真实界面：重启桌面端后确认「余额来源」仍是上次选的 OCG 套餐；设置页下拉显示同一值。
 
 ## 已知边界
 
-- 只适配了 5h 窗口；`周`/`月` 两个窗口在宿主响应里已带上，胶囊未显示（可在 `ocgPickWindow`
-  与 `OCG_PRIMARY_WINDOW` 处改）。
+- 5h 是主读数；`周`/`月` 两个窗口在悬停卡片里显示。
 - provider 判定用 `current.provider === 'opencode-go'`（或以其开头），与 DSH
   `llm-pi-ai` 配置里的 provider id 一致。
